@@ -31,6 +31,7 @@ else:
         ("AirLLMInternLM", ".airllm_internlm"),
         ("AirLLMMistral", ".airllm_mistral"),
         ("AirLLMMixtral", ".airllm_mixtral"),
+        ("AirLLMQwen3", ".airllm_qwen3"),
         ("AirLLMKimiK3", ".airllm_kimi_k3"),
     ):
         try:

@@ -5,5 +5,7 @@ airllm.egg-info
 build
 dist
 __pycache__
+.conda_env/
+hf_cache/
 # Package README is generated from the top-level README.md at build time
 air_llm/README.md

@@ -74,12 +74,10 @@ class NotEnoughSpaceException(Exception):
 
 # Function to clean RAM & vRAM
 def clean_memory():
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception as ex:
-        # maybe platform
-        pass
+    # Weight streaming keeps a bounded set of tensors alive; CPython refcounting frees them
+    # immediately, so a full gc.collect() here (and the malloc_trim below) is pure overhead that
+    # dominated the per-layer post-hook. We only ask the CUDA allocator to return cached blocks;
+    # that is cheap when there is nothing to release.
     torch.cuda.empty_cache()
 
 
@@ -119,16 +117,28 @@ def layer_tensor_names(local_path, layer_name):
         return list(f.keys())
 
 
+_safe_open_cache = {}
+
+
 def load_layer_subset(local_path, layer_name, keys):
     """Read only `keys` from a layer shard.
 
     safetensors can seek to individual tensors, so a single MoE expert costs its own few MB rather
     than the whole ~16GB layer file. That is what makes per-expert streaming worthwhile.
+
+    The open handle is cached per shard file: re-parsing the (large) safetensors JSON header for
+    every one of the thousands of per-expert reads dwarfs the actual tensor reads (~2.7ms vs
+    ~0.1ms). Shards are immutable after splitting, and concurrent ``get_tensor`` calls on the
+    shared read-only mmap are safe.
     """
+    path = str(Path(local_path) / (layer_name + ".safetensors"))
+    f = _safe_open_cache.get(path)
+    if f is None:
+        f = safe_open(path, framework="pt")
+        _safe_open_cache[path] = f
     out = {}
-    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
-        for k in keys:
-            out[k] = f.get_tensor(k)
+    for k in keys:
+        out[k] = f.get_tensor(k)
     return out
 
 
@@ -162,7 +172,8 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     if compression == '4bit':
-        total_shard_files_size_bytes = int(total_shard_files_size_bytes / 0.2813)
+        # NF4 stores ~0.5 bytes/param vs 2 bytes for fp16, so a 4bit split is ~0.28x the source size.
+        total_shard_files_size_bytes = int(total_shard_files_size_bytes * 0.2813)
     elif compression == '8bit':
         total_shard_files_size_bytes = total_shard_files_size_bytes // 2
 

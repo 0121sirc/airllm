@@ -15,7 +15,7 @@ from transformers.quantizers import AutoHfQuantizer
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
-    find_or_create_local_splitted_path
+    uncompress_layer_state_dict, find_or_create_local_splitted_path
 from .persist import ModelPersister
 
 try:
@@ -169,9 +169,6 @@ class AirLLMBaseModel:
 
         # prefetch executor / state
         self.prefetching = prefetching
-        if self.compression is not None and self.prefetching:
-            print("prefetching is not supported together with compression for now; disabling prefetching.")
-            self.prefetching = False
         self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
         self._prefetch_future = None
         self._prefetched_idx = None
@@ -696,7 +693,8 @@ class AirLLMBaseModel:
     def _expert_pre_hook(self, module, args):
         layer_idx, expert_idx = module._airllm_expert
         keys = self._expert_keys[layer_idx][expert_idx]
-        state_dict = load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys)
+        state_dict = self._maybe_decompress(
+            load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys))
         module._airllm_moved = self.move_layer_to_device(state_dict)
 
     def _expert_post_hook(self, module, args, output):
@@ -709,19 +707,33 @@ class AirLLMBaseModel:
         nxt = idx + 1
         return nxt if nxt in self._streamed_set else None
 
-    def _load_streamed_layer(self, idx):
+    def _maybe_decompress(self, state_dict):
+        """Expand block-wise quantized (4bit/8bit) tensors back to plain weights.
+
+        The splitter stores quantized payloads (and their companion quant-state tensors) under the
+        same per-expert keys, so a ``load_layer_subset`` read of a compressed shard returns raw
+        packed tensors. Decompress them exactly like the whole-layer path does before they reach
+        ``move_layer_to_device``.
+        """
+        if self.compression is not None:
+            return uncompress_layer_state_dict(state_dict)
+        return state_dict
+
+    def _load_streamed_layer(self, idx, decompress=True):
         """Load one streamed module's weights. Experts are excluded when they stream themselves."""
         keys = self._non_expert_keys.get(idx) if getattr(self, '_expert_streaming', False) else None
         if keys is None:
             return self.load_layer_to_cpu(self.layer_names[idx])
-        return load_layer_subset(self.checkpoint_path, self.layer_names[idx], keys)
+        raw = load_layer_subset(self.checkpoint_path, self.layer_names[idx], keys)
+        return self._maybe_decompress(raw) if decompress else raw
 
     def _pre_hook(self, module, args):
         idx = module._airllm_idx
 
         if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == idx:
-            state_dict = self._prefetch_future.result()
+            raw = self._prefetch_future.result()
             self._prefetch_future = None
+            state_dict = self._maybe_decompress(raw)
         else:
             state_dict = self._load_streamed_layer(idx)
 
@@ -730,18 +742,18 @@ class AirLLMBaseModel:
         if self.prefetching:
             nxt = self._next_streamed_idx(idx)
             if nxt is not None:
-                self._prefetch_future = self._executor.submit(self._load_streamed_layer, nxt)
+                self._prefetch_future = self._executor.submit(self._load_streamed_layer, nxt, False)
                 self._prefetched_idx = nxt
 
     def _post_hook(self, module, args, output):
         # module.to('meta') would also evict the experts, which manage their own lifetime, so with
-        # expert streaming we only release exactly what this hook placed.
+        # expert streaming we only release exactly what this hook placed. The CUDA caching
+        # allocator reuses the freed blocks for the next layer, so no clean_memory() here.
         if self.hf_quantizer is not None or getattr(self, '_expert_streaming', False):
             for param_name in getattr(module, '_airllm_moved', []):
                 set_module_tensor_to_device(self.model, param_name, 'meta')
         else:
             module.to('meta')
-        clean_memory()
         return output
 
     # ---- delegation to the underlying transformers model ------------------------------------

@@ -21,6 +21,8 @@ ARCH_OVERRIDES = {
     "BaichuanForCausalLM": "AirLLMBaichuan",
     "BaiChuanForCausalLM": "AirLLMBaichuan",
     "InternLMForCausalLM": "AirLLMInternLM",
+    "Qwen3ForCausalLM": "AirLLMQwen3",
+    "Qwen3MoeForCausalLM": "AirLLMQwen3",
     "KimiK3ForConditionalGeneration": "AirLLMKimiK3",
 }
 
